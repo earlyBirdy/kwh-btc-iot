@@ -1,51 +1,202 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+import json
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
 
 from .models import EnergyLog, EnergyBatch
 
+DB_PATH = Path(__file__).resolve().parent.parent / "kwh_btc_iot.db"
 
-class InMemoryStorage:
-    """Simple storage backend for demo and tests.
 
-    Replace with a real database for production use.
-    """
+def _get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    def __init__(self) -> None:
-        self._logs: Dict[str, EnergyLog] = {}
-        self._batches: Dict[str, EnergyBatch] = {}
 
-    # Logs
+def _init_db() -> None:
+    conn = _get_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS energy_logs (
+            id TEXT PRIMARY KEY,
+            meter_id TEXT NOT NULL,
+            site_id TEXT NOT NULL,
+            iot_device_id TEXT NOT NULL,
+            ts_start TEXT NOT NULL,
+            ts_end TEXT NOT NULL,
+            interval_s INTEGER NOT NULL,
+            batch_id TEXT,
+            leaf_hash TEXT NOT NULL,
+            raw_json TEXT NOT NULL
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS energy_batches (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            log_count INTEGER NOT NULL,
+            merkle_root TEXT NOT NULL,
+            anchor_status TEXT NOT NULL,
+            anchor_txid TEXT,
+            anchor_block_hash TEXT,
+            anchor_block_height INTEGER,
+            anchor_block_time TEXT
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+_init_db()
+
+
+class SQLiteStorage:
+    """SQLite-backed storage for logs and batches."""
 
     def save_log(self, log: EnergyLog) -> None:
-        self._logs[log.id] = log
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO energy_logs
+            (id, meter_id, site_id, iot_device_id, ts_start, ts_end, interval_s,
+             batch_id, leaf_hash, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                log.id,
+                log.meter_id,
+                log.site_id,
+                log.iot_device_id,
+                log.ts_start.isoformat(),
+                log.ts_end.isoformat(),
+                log.interval_s,
+                log.batch_id,
+                log.leaf_hash,
+                json.dumps(log.model_dump(), sort_keys=True),
+            ),
+        )
+        conn.commit()
+        conn.close()
 
     def list_logs(self) -> List[EnergyLog]:
-        return list(self._logs.values())
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM energy_logs ORDER BY ts_start ASC")
+        rows = cur.fetchall()
+        conn.close()
+        return [self._log_from_row(r) for r in rows]
 
     def get_unbatched_logs(self) -> List[EnergyLog]:
-        return [l for l in self._logs.values() if l.batch_id is None]
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM energy_logs WHERE batch_id IS NULL ORDER BY ts_start ASC")
+        rows = cur.fetchall()
+        conn.close()
+        return [self._log_from_row(r) for r in rows]
 
     def get_logs_by_ids(self, ids: List[str]) -> List[EnergyLog]:
-        return [self._logs[i] for i in ids if i in self._logs]
+        if not ids:
+            return []
+        conn = _get_conn()
+        cur = conn.cursor()
+        qmarks = ",".join("?" for _ in ids)
+        cur.execute(f"SELECT * FROM energy_logs WHERE id IN ({qmarks}) ORDER BY ts_start ASC", ids)
+        rows = cur.fetchall()
+        conn.close()
+        return [self._log_from_row(r) for r in rows]
 
     def set_batch_for_logs(self, batch_id: str, log_ids: List[str]) -> None:
-        for log_id in log_ids:
-            if log_id in self._logs:
-                log = self._logs[log_id]
-                log.batch_id = batch_id
-                self._logs[log_id] = log
-
-    # Batches
+        if not log_ids:
+            return
+        conn = _get_conn()
+        cur = conn.cursor()
+        qmarks = ",".join("?" for _ in log_ids)
+        cur.execute(f"UPDATE energy_logs SET batch_id = ? WHERE id IN ({qmarks})", [batch_id, *log_ids])
+        conn.commit()
+        conn.close()
 
     def save_batch(self, batch: EnergyBatch) -> None:
-        self._batches[batch.id] = batch
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO energy_batches
+            (id, created_at, log_count, merkle_root,
+             anchor_status, anchor_txid, anchor_block_hash,
+             anchor_block_height, anchor_block_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                batch.id,
+                batch.created_at.isoformat(),
+                batch.log_count,
+                batch.merkle_root,
+                batch.anchor_status,
+                batch.anchor_txid,
+                batch.anchor_block_hash,
+                batch.anchor_block_height,
+                batch.anchor_block_time.isoformat() if batch.anchor_block_time else None,
+            ),
+        )
+        conn.commit()
+        conn.close()
 
     def list_batches(self) -> List[EnergyBatch]:
-        return list(self._batches.values())
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM energy_batches ORDER BY created_at DESC")
+        rows = cur.fetchall()
+        conn.close()
+        return [self._batch_from_row(r) for r in rows]
 
     def get_batch(self, batch_id: str) -> Optional[EnergyBatch]:
-        return self._batches.get(batch_id)
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM energy_batches WHERE id = ?", (batch_id,))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return self._batch_from_row(row)
+
+    def _log_from_row(self, row: sqlite3.Row) -> EnergyLog:
+        data = json.loads(row["raw_json"])
+        data.update(
+            {
+                "id": row["id"],
+                "batch_id": row["batch_id"],
+                "leaf_hash": row["leaf_hash"],
+            }
+        )
+        return EnergyLog.model_validate(data)
+
+    def _batch_from_row(self, row: sqlite3.Row) -> EnergyBatch:
+        created_at = datetime.fromisoformat(row["created_at"])
+        anchor_block_time = datetime.fromisoformat(row["anchor_block_time"]) if row["anchor_block_time"] else None
+        return EnergyBatch(
+            id=row["id"],
+            created_at=created_at,
+            log_ids=[],  # can be derived via queries if needed
+            merkle_root=row["merkle_root"],
+            log_count=row["log_count"],
+            anchor_status=row["anchor_status"],
+            anchor_txid=row["anchor_txid"],
+            anchor_block_hash=row["anchor_block_hash"],
+            anchor_block_height=row["anchor_block_height"],
+            anchor_block_time=anchor_block_time,
+        )
 
 
-storage = InMemoryStorage()
+storage = SQLiteStorage()
