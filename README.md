@@ -263,3 +263,63 @@ The Web UI at `/` now shows two extra columns in the Logs table:
 - **Amount (sats)**
 
 These are taken from the nested `tx` object returned by the API.
+
+
+### CLI Merkle proof verifier
+
+You can verify a proof from `GET /api/v1/logs/{log_id}/proof` locally:
+
+```bash
+curl http://127.0.0.1:8000/api/v1/logs/<log_id>/proof > proof.json
+python verify_proof.py proof.json
+```
+
+Exit code:
+- `0` = proof valid
+- `1` = invalid / error
+
+### Batch export endpoint
+
+For external anchoring tools, export a batch and its logs:
+
+```http
+GET /api/v1/batches/{batch_id}/export
+```
+
+Response:
+
+```json
+{
+  "batch": { ...EnergyBatch... },
+  "logs": [ ...EnergyLog... ]
+}
+```
+
+### kWh → sats dashboard
+
+The Web UI at `/` now has a **Dashboard** section that aggregates:
+
+- Total kWh per day & device
+- Total sats per day & device
+
+Data is computed client-side from `/api/v1/logs`.
+
+### MQTT bridge connection error reminder
+
+If you see:
+
+`ConnectionRefusedError: [Errno 61] Connection refused`
+
+it means there is **no MQTT broker listening** on `MQTT_BROKER_HOST:MQTT_BROKER_PORT`
+(default `localhost:1883`). You must start a broker first, for example on macOS:
+
+```bash
+brew install mosquitto
+brew services start mosquitto
+```
+
+Then re-run:
+
+```bash
+python mqtt_bridge.py
+```

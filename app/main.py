@@ -18,7 +18,7 @@ from .batching import flush_batch as flush_batch_logic
 app = FastAPI(
     title="kwh-btc-iot",
     description="IoT-first energy+BTC logging gateway with Merkle batching (SQLite backend).",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -41,6 +41,11 @@ class MerkleProofResponse(BaseModel):
     proof: List[MerkleProofStep]
 
 
+class BatchExportResponse(BaseModel):
+    batch: EnergyBatch
+    logs: List[EnergyLog]
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok", time=datetime.utcnow())
@@ -48,7 +53,7 @@ def health() -> HealthResponse:
 
 @app.get("/", response_class=HTMLResponse)
 def web_ui() -> str:
-    """Very simple web UI (single page) showing logs and batches."""
+    """Web UI: logs, batches, and a simple kWh → sats dashboard."""
     return """<!doctype html>
 <html>
   <head>
@@ -66,6 +71,7 @@ def web_ui() -> str:
       .badge-ok { background: #e0f7e9; color: #146c2e; }
       .badge-pending { background: #fff8e1; color: #8a6d1f; }
       .mono { font-family: monospace; font-size: 0.75rem; }
+      .section { margin-top: 2rem; }
     </style>
   </head>
   <body>
@@ -78,11 +84,20 @@ def web_ui() -> str:
       <span id="status"></span>
     </div>
 
-    <h2>Logs</h2>
-    <div id="logs"></div>
+    <div class="section">
+      <h2>Dashboard – kWh → sats (per day & device)</h2>
+      <div id="dashboard"></div>
+    </div>
 
-    <h2>Batches</h2>
-    <div id="batches"></div>
+    <div class="section">
+      <h2>Logs</h2>
+      <div id="logs"></div>
+    </div>
+
+    <div class="section">
+      <h2>Batches</h2>
+      <div id="batches"></div>
+    </div>
 
     <script>
       async function fetchJSON(url, options) {
@@ -98,6 +113,19 @@ def web_ui() -> str:
         if (!ts) return "";
         try {
           return new Date(ts).toLocaleString();
+        } catch {
+          return ts;
+        }
+      }
+
+      function dateOnly(ts) {
+        if (!ts) return "";
+        try {
+          const d = new Date(ts);
+          const y = d.getFullYear();
+          const m = String(d.getMonth() + 1).padStart(2, "0");
+          const day = String(d.getDate()).padStart(2, "0");
+          return `${y}-${m}-${day}`;
         } catch {
           return ts;
         }
@@ -181,13 +209,67 @@ def web_ui() -> str:
         }
       }
 
+      async function loadDashboard() {
+        const container = document.getElementById("dashboard");
+        container.innerHTML = "Loading...";
+        try {
+          const data = await fetchJSON("/api/v1/logs");
+          if (!data.length) {
+            container.innerHTML = "<em>No logs yet.</em>";
+            return;
+          }
+          // Aggregate by (day, device)
+          const agg = {};
+          for (const log of data) {
+            const day = dateOnly(log.ts_start);
+            const dev = log.iot_device_id;
+            const key = day + "||" + dev;
+            if (!agg[key]) {
+              agg[key] = {
+                day,
+                device: dev,
+                energy_kwh: 0,
+                amount_sats: 0,
+              };
+            }
+            agg[key].energy_kwh += Number(log.energy_kwh || 0);
+            if (log.tx && typeof log.tx.amount_sats === "number") {
+              agg[key].amount_sats += log.tx.amount_sats;
+            }
+          }
+          const rows = Object.values(agg).sort((a, b) => {
+            if (a.day < b.day) return -1;
+            if (a.day > b.day) return 1;
+            if (a.device < b.device) return -1;
+            if (a.device > b.device) return 1;
+            return 0;
+          });
+          let html = "<table><thead><tr>" +
+            "<th>Day</th><th>Device</th>" +
+            "<th>Total kWh</th><th>Total sats</th>" +
+            "</tr></thead><tbody>";
+          for (const r of rows) {
+            html += "<tr>" +
+              `<td>${r.day}</td>` +
+              `<td>${r.device}</td>` +
+              `<td>${r.energy_kwh.toFixed(3)}</td>` +
+              `<td>${r.amount_sats}</td>` +
+              "</tr>";
+          }
+          html += "</tbody></table>";
+          container.innerHTML = html;
+        } catch (err) {
+          container.innerHTML = "<span style='color:red'>Error building dashboard</span>";
+          console.error(err);
+        }
+      }
+
       async function flushBatch() {
         try {
           setStatus("Flushing batch...", false);
           await fetchJSON("/api/v1/batches/flush", { method: "POST" });
           setStatus("Batch created.", false);
-          await loadLogs();
-          await loadBatches();
+          await reloadAll();
         } catch (err) {
           console.error(err);
           setStatus("Error flushing batch: " + err.message, true);
@@ -195,6 +277,7 @@ def web_ui() -> str:
       }
 
       async function reloadAll() {
+        await loadDashboard();
         await loadLogs();
         await loadBatches();
         setStatus("Reloaded.", false);
@@ -290,3 +373,14 @@ def get_log_proof(log_id: str) -> MerkleProofResponse:
         index=index,
         proof=proof_steps,
     )
+
+
+@app.get("/api/v1/batches/{batch_id}/export", response_model=BatchExportResponse)
+def export_batch(batch_id: str) -> BatchExportResponse:
+    """Export a batch plus its logs as JSON for external anchoring tools."""
+    batch = storage.get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    logs = storage.get_logs_by_batch(batch_id)
+    return BatchExportResponse(batch=batch, logs=logs)
