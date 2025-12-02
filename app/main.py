@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -18,7 +18,7 @@ from .batching import flush_batch as flush_batch_logic
 app = FastAPI(
     title="kwh-btc-iot",
     description="IoT-first energy+BTC logging gateway with Merkle batching (SQLite backend).",
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -46,6 +46,12 @@ class BatchExportResponse(BaseModel):
     logs: List[EnergyLog]
 
 
+class AnchorSimulateRequest(BaseModel):
+    txid: Optional[str] = None
+    block_hash: Optional[str] = None
+    block_height: Optional[int] = None
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok", time=datetime.utcnow())
@@ -70,6 +76,7 @@ def web_ui() -> str:
       .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; }
       .badge-ok { background: #e0f7e9; color: #146c2e; }
       .badge-pending { background: #fff8e1; color: #8a6d1f; }
+      .badge-anchored { background: #e3f2fd; color: #0d47a1; }
       .mono { font-family: monospace; font-size: 0.75rem; }
       .section { margin-top: 2rem; }
     </style>
@@ -189,16 +196,24 @@ def web_ui() -> str:
           }
           let html = "<table><thead><tr>" +
             "<th>ID</th><th>Created</th><th>Log count</th>" +
-            "<th>Merkle root</th><th>Anchor status</th>" +
+            "<th>Merkle root</th><th>Anchor status</th><th>TXID</th>" +
+            "<th>Actions</th>" +
             "</tr></thead><tbody>";
           for (const b of data) {
-            const statusBadge = `<span class='badge badge-pending'>${b.anchor_status}</span>`;
+            let badgeClass = "badge-pending";
+            if (b.anchor_status === "anchored") {
+              badgeClass = "badge-anchored";
+            }
+            const statusBadge = `<span class='badge ${badgeClass}'>${b.anchor_status}</span>`;
+            const txid = b.anchor_txid || "";
             html += "<tr>" +
               `<td>${b.id}</td>` +
               `<td>${fmtTs(b.created_at)}</td>` +
               `<td>${b.log_count}</td>` +
               `<td class='mono'>${b.merkle_root}</td>` +
               `<td>${statusBadge}</td>` +
+              `<td class='mono'>${txid}</td>` +
+              `<td><button onclick="simulateAnchor('${b.id}')">Sim anchor</button></td>` +
               "</tr>";
           }
           html += "</tbody></table>";
@@ -218,7 +233,6 @@ def web_ui() -> str:
             container.innerHTML = "<em>No logs yet.</em>";
             return;
           }
-          // Aggregate by (day, device)
           const agg = {};
           for (const log of data) {
             const day = dateOnly(log.ts_start);
@@ -273,6 +287,22 @@ def web_ui() -> str:
         } catch (err) {
           console.error(err);
           setStatus("Error flushing batch: " + err.message, true);
+        }
+      }
+
+      async function simulateAnchor(batchId) {
+        try {
+          setStatus("Simulating anchor for " + batchId + "...", false);
+          await fetchJSON(`/api/v1/batches/${batchId}/anchor/simulate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          });
+          setStatus("Anchor simulated for " + batchId, false);
+          await loadBatches();
+        } catch (err) {
+          console.error(err);
+          setStatus("Error simulating anchor: " + err.message, true);
         }
       }
 
@@ -343,7 +373,6 @@ def get_log_proof(log_id: str) -> MerkleProofResponse:
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
 
-    # Rebuild leaf list for this batch in a deterministic order.
     batch_logs = storage.get_logs_by_batch(log.batch_id)
     leaf_list = [l.leaf_hash for l in batch_logs]
 
@@ -354,7 +383,6 @@ def get_log_proof(log_id: str) -> MerkleProofResponse:
             status_code=500, detail="Log not found in its own batch"
         ) from None
 
-    # Recompute Merkle root from these leaves and verify against stored root.
     recomputed_root = build_merkle_root(leaf_list)
     if recomputed_root != batch.merkle_root:
         raise HTTPException(
@@ -384,3 +412,28 @@ def export_batch(batch_id: str) -> BatchExportResponse:
 
     logs = storage.get_logs_by_batch(batch_id)
     return BatchExportResponse(batch=batch, logs=logs)
+
+
+@app.post("/api/v1/batches/{batch_id}/anchor/simulate", response_model=EnergyBatch)
+def simulate_anchor(batch_id: str, body: AnchorSimulateRequest) -> EnergyBatch:
+    """Anchor simulator: write fake txid & block info to show full lifecycle."""
+    batch = storage.get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    now = datetime.utcnow()
+    txid = body.txid or f"simtx_{batch_id}"
+    block_hash = body.block_hash or f"simblock_{batch_id}"
+    block_height = body.block_height or 100000
+
+    updated = storage.update_batch_anchor(
+        batch_id=batch_id,
+        anchor_status="anchored",
+        anchor_txid=txid,
+        anchor_block_hash=block_hash,
+        anchor_block_height=block_height,
+        anchor_block_time=now,
+    )
+    if not updated:
+        raise HTTPException(status_code=500, detail="Failed to update batch anchor info")
+    return updated

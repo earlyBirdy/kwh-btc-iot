@@ -206,6 +206,41 @@ class SQLiteStorage:
             return None
         return self._batch_from_row(row)
 
+    def update_batch_anchor(
+        self,
+        batch_id: str,
+        anchor_status: str,
+        anchor_txid: str,
+        anchor_block_hash: str | None,
+        anchor_block_height: int | None,
+        anchor_block_time: datetime | None,
+    ) -> Optional[EnergyBatch]:
+        """Update anchor-related fields for a batch and return the updated object."""
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE energy_batches
+            SET anchor_status = ?,
+                anchor_txid = ?,
+                anchor_block_hash = ?,
+                anchor_block_height = ?,
+                anchor_block_time = ?
+            WHERE id = ?
+            """,
+            (
+                anchor_status,
+                anchor_txid,
+                anchor_block_hash,
+                anchor_block_height,
+                anchor_block_time.isoformat() if anchor_block_time else None,
+                batch_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return self.get_batch(batch_id)
+
     # Row helpers -----
 
     def _log_from_row(self, row: sqlite3.Row) -> EnergyLog:
@@ -229,7 +264,7 @@ class SQLiteStorage:
         return EnergyBatch(
             id=row["id"],
             created_at=created_at,
-            log_ids=[],  # can derive via get_logs_by_batch if needed
+            log_ids=[],  # derive via get_logs_by_batch if needed
             merkle_root=row["merkle_root"],
             log_count=row["log_count"],
             anchor_status=row["anchor_status"],
