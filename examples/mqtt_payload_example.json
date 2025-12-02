@@ -1,0 +1,12 @@
+{
+  "ts_start": "2025-12-01T10:10:00Z",
+  "ts_end": "2025-12-01T10:15:00Z",
+  "interval_s": 300,
+  "energy_kwh": 12.34,
+  "power_kw_avg": 2.47,
+  "price_sats_per_kwh": 100,
+  "status": "ok",
+  "tags": [
+    "peak"
+  ]
+}
