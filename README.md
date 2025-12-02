@@ -374,3 +374,6 @@ calls this endpoint and updates:
 
 - `anchor_status` → `anchored`
 - `anchor_txid`, `anchor_block_hash`, `anchor_block_height`, `anchor_block_time`
+
+## White Paper
+See `/docs/kwh-btc-iot-whitepaper.md` for the full architecture overview.
