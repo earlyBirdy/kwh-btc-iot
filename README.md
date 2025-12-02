@@ -218,3 +218,48 @@ Then open:
 - Web UI: http://127.0.0.1:8000/
 - API docs: http://127.0.0.1:8000/docs
 - Health: http://127.0.0.1:8000/health
+
+
+## New features
+
+### Merkle proof endpoint
+
+You can now retrieve a Merkle proof for any log that has been batched:
+
+- **Endpoint:** `GET /api/v1/logs/{log_id}/proof`
+- Returns:
+  - `leaf_hash`
+  - `merkle_root`
+  - `batch_id`
+  - `index` in the leaf list
+  - `proof[]` (array of `{position, hash}` steps)
+
+This is enough for an external verifier to recompute the path and confirm inclusion.
+
+### MQTT bridge
+
+A tiny MQTT bridge script is included:
+
+- File: `mqtt_bridge.py`
+- Subscribes to: `energy/<site_id>/<iot_device_id>/<meter_id>`
+- Expects payload similar to `examples/mqtt_payload_example.json`
+- Builds canonical emlog-1.1 JSON and `POST`s to `/api/v1/logs`.
+
+Example usage:
+
+```bash
+export MQTT_BROKER_HOST=localhost
+export MQTT_BROKER_PORT=1883
+export KWH_BTC_IOT_API=http://127.0.0.1:8000
+
+python mqtt_bridge.py
+```
+
+### Web UI sats columns
+
+The Web UI at `/` now shows two extra columns in the Logs table:
+
+- **Price (sats/kWh)**
+- **Amount (sats)**
+
+These are taken from the nested `tx` object returned by the API.

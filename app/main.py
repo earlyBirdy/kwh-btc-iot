@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import List
+from typing import List, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from uuid import uuid4
 
 from .models import EnergyLogIn, EnergyLog, EnergyBatch
-from .merkle import leaf_hash_from_payload
+from .merkle import leaf_hash_from_payload, build_merkle_root, build_merkle_proof
 from .storage import storage
 from .batching import flush_batch as flush_batch_logic
 
@@ -18,13 +18,27 @@ from .batching import flush_batch as flush_batch_logic
 app = FastAPI(
     title="kwh-btc-iot",
     description="IoT-first energy+BTC logging gateway with Merkle batching (SQLite backend).",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
 class HealthResponse(BaseModel):
     status: str
     time: datetime
+
+
+class MerkleProofStep(BaseModel):
+    position: Literal["left", "right"]
+    hash: str
+
+
+class MerkleProofResponse(BaseModel):
+    log_id: str
+    batch_id: str
+    leaf_hash: str
+    merkle_root: str
+    index: int
+    proof: List[MerkleProofStep]
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -34,12 +48,7 @@ def health() -> HealthResponse:
 
 @app.get("/", response_class=HTMLResponse)
 def web_ui() -> str:
-    """Very simple web UI (single page) showing logs and batches.
-
-    One-command experience:
-        uvicorn app.main:app --reload
-    and then open http://127.0.0.1:8000/
-    """
+    """Very simple web UI (single page) showing logs and batches."""
     return """<!doctype html>
 <html>
   <head>
@@ -56,6 +65,7 @@ def web_ui() -> str:
       .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; }
       .badge-ok { background: #e0f7e9; color: #146c2e; }
       .badge-pending { background: #fff8e1; color: #8a6d1f; }
+      .mono { font-family: monospace; font-size: 0.75rem; }
     </style>
   </head>
   <body>
@@ -110,10 +120,14 @@ def web_ui() -> str:
           }
           let html = "<table><thead><tr>" +
             "<th>ID</th><th>Site</th><th>Device</th><th>Meter</th>" +
-            "<th>Start</th><th>End</th><th>kWh</th><th>Status</th><th>Batch</th>" +
+            "<th>Start</th><th>End</th><th>kWh</th>" +
+            "<th>Price (sats/kWh)</th><th>Amount (sats)</th>" +
+            "<th>Status</th><th>Batch</th>" +
             "</tr></thead><tbody>";
           for (const log of data) {
             const statusBadge = `<span class='badge badge-ok'>${log.status}</span>`;
+            const price = log.tx ? log.tx.price_sats_per_kwh : "";
+            const amount = log.tx ? log.tx.amount_sats : "";
             html += "<tr>" +
               `<td>${log.id}</td>` +
               `<td>${log.site_id}</td>` +
@@ -122,6 +136,8 @@ def web_ui() -> str:
               `<td>${fmtTs(log.ts_start)}</td>` +
               `<td>${fmtTs(log.ts_end)}</td>` +
               `<td>${log.energy_kwh}</td>` +
+              `<td>${price}</td>` +
+              `<td>${amount}</td>` +
               `<td>${statusBadge}</td>` +
               `<td>${log.batch_id || ""}</td>` +
               "</tr>";
@@ -153,7 +169,7 @@ def web_ui() -> str:
               `<td>${b.id}</td>` +
               `<td>${fmtTs(b.created_at)}</td>` +
               `<td>${b.log_count}</td>` +
-              `<td style='font-family:monospace;font-size:0.75rem'>${b.merkle_root}</td>` +
+              `<td class='mono'>${b.merkle_root}</td>` +
               `<td>${statusBadge}</td>` +
               "</tr>";
           }
@@ -196,7 +212,9 @@ def create_log(payload: EnergyLogIn) -> EnergyLog:
     """Ingest a canonical energy+BTC log."""
     log_id = f"log_{uuid4().hex[:12]}"
 
-    json_bytes = json.dumps(payload.model_dump(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    json_bytes = json.dumps(
+        payload.model_dump(), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
     leaf = leaf_hash_from_payload(json_bytes)
 
     log = EnergyLog(id=log_id, leaf_hash=leaf, **payload.model_dump())
@@ -224,3 +242,51 @@ def flush_batch() -> EnergyBatch:
 def list_batches() -> List[EnergyBatch]:
     """List all batches."""
     return storage.list_batches()
+
+
+@app.get("/api/v1/logs/{log_id}/proof", response_model=MerkleProofResponse)
+def get_log_proof(log_id: str) -> MerkleProofResponse:
+    """Return Merkle proof for a given log_id (if batched)."""
+    log = storage.get_log(log_id)
+    if not log:
+        raise HTTPException(status_code=404, detail="Log not found")
+
+    if not log.batch_id:
+        raise HTTPException(
+            status_code=400, detail="Log has not been assigned to a batch yet"
+        )
+
+    batch = storage.get_batch(log.batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    # Rebuild leaf list for this batch in a deterministic order.
+    batch_logs = storage.get_logs_by_batch(log.batch_id)
+    leaf_list = [l.leaf_hash for l in batch_logs]
+
+    try:
+        index = [l.id for l in batch_logs].index(log_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=500, detail="Log not found in its own batch"
+        ) from None
+
+    # Recompute Merkle root from these leaves and verify against stored root.
+    recomputed_root = build_merkle_root(leaf_list)
+    if recomputed_root != batch.merkle_root:
+        raise HTTPException(
+            status_code=500,
+            detail="Merkle root mismatch for batch; stored root may be inconsistent",
+        )
+
+    proof_steps_raw = build_merkle_proof(leaf_list, index)
+    proof_steps = [MerkleProofStep(**s) for s in proof_steps_raw]
+
+    return MerkleProofResponse(
+        log_id=log_id,
+        batch_id=log.batch_id,
+        leaf_hash=log.leaf_hash,
+        merkle_root=batch.merkle_root,
+        index=index,
+        proof=proof_steps,
+    )
