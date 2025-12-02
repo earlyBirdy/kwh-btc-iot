@@ -323,3 +323,54 @@ Then re-run:
 ```bash
 python mqtt_bridge.py
 ```
+
+
+## Docker & docker-compose quickstart
+
+You can run the API and Mosquitto broker together with:
+
+```bash
+docker compose up --build
+```
+
+This will start:
+
+- `api` → FastAPI app on port `8000`
+- `mosquitto` → MQTT broker on port `1883`
+
+Inside the `api` container, the default envs are:
+
+- `KWH_BTC_IOT_API=http://api:8000`
+- `MQTT_BROKER_HOST=mosquitto`
+- `MQTT_BROKER_PORT=1883`
+
+You can still run `mqtt_bridge.py` on your host and point it to `localhost:1883`
+(or to the container IP if you prefer a containerized bridge as well).
+
+## Anchor simulator
+
+To demonstrate a full lifecycle without connecting to a real Bitcoin stack,
+an anchor simulator endpoint is available:
+
+```http
+POST /api/v1/batches/{batch_id}/anchor/simulate
+```
+
+Optional JSON body:
+
+```json
+{
+  "txid": "optional-fake-txid",
+  "block_hash": "optional-fake-block-hash",
+  "block_height": 123456
+}
+```
+
+If fields are omitted, the server will generate simple `simtx_*` and `simblock_*`
+values and use a dummy block height.
+
+The Web UI at `/` now includes a **“Sim anchor”** button for each batch, which
+calls this endpoint and updates:
+
+- `anchor_status` → `anchored`
+- `anchor_txid`, `anchor_block_hash`, `anchor_block_height`, `anchor_block_time`
