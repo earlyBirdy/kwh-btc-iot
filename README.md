@@ -200,3 +200,21 @@ kwh-btc-iot/
 - Implement Bitcoin anchoring worker
   - Stores `anchor_txid`, `anchor_block_hash`, `anchor_block_height`
 - Add basic web UI for browsing logs and batches
+
+
+### SQLite backend & one-command Web UI
+
+This repo now uses **SQLite** (`kwh_btc_iot.db` in the repo root) as the storage backend
+and includes a minimal Web UI.
+
+Run everything with a single command:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+Then open:
+
+- Web UI: http://127.0.0.1:8000/
+- API docs: http://127.0.0.1:8000/docs
+- Health: http://127.0.0.1:8000/health
